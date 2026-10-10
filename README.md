@@ -95,29 +95,34 @@ These lamps have a few quirks. The integration works around them, but it helps t
 
 ### Example: pick a mode when the wall switch turns the lamp on
 
-When the lamp gets power it goes from *unavailable* to *on* in cold white. This switches it to the brightest white
-instead:
+If the wall switch is a smart switch in Home Assistant, this sets the brightest white every time it powers the lamp
+on, whatever mode the lamp boots in:
 
 ```yaml
 automation:
   - alias: Bathroom light - full white after power-on
     triggers:
       - trigger: state
-        entity_id: light.bathroom_light
-        from: unavailable
+        entity_id: switch.bathroom_wall_switch
+        from: "off"
         to: "on"
-    conditions:
-      - condition: template
-        value_template: "{{ trigger.to_state.attributes.effect == 'White: cold' }}"
     actions:
+      - wait_template: >-
+          {{ is_state('light.bathroom_light', 'on')
+             and states.light.bathroom_light.last_changed > trigger.from_state.last_changed }}
+        timeout: 30
+        continue_on_timeout: false
       - action: light.turn_on
         target:
           entity_id: light.bathroom_light
         data:
           effect: "White: sunlight (max)"
+    mode: restart
 ```
 
-The condition makes sure it only reacts to a real power-up, not to Home Assistant restarting.
+Triggering on the switch means a Home Assistant restart doesn't count as a power-up. The wait is for the lamp to come
+back after the power cut. It's a state check rather than a trigger, because the switch can report *on* a moment
+after the lamp is already back.
 
 ## Troubleshooting
 
