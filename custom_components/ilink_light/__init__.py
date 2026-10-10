@@ -1,104 +1,50 @@
-"""Support for iLink lights."""
+"""iLink (JieLi) BLE lights."""
 
+from __future__ import annotations
 
+import logging
+
+from homeassistant.components import bluetooth
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_DEVICES
+from homeassistant.const import CONF_ADDRESS, Platform
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import device_registry as dr, entity_registry as er
-from homeassistant.helpers.device_registry import DeviceEntry
+from homeassistant.helpers import entity_registry as er
 
-from .const import LOGGER, CONF_MAC, CONF_NAME, DOMAIN, PLATFORMS
-from .coordinator import LightCoordinator
+from .ilink import IlinkLight
+
+_LOGGER = logging.getLogger(__name__)
+PLATFORMS = [Platform.LIGHT]
+
+type IlinkConfigEntry = ConfigEntry[IlinkLight]
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    # Set up platform from a ConfigEntry."""
-    LOGGER.debug("Setting up configuration for iLink lights!")
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][CONF_DEVICES] = {}
-
-    # Create one coordinator for each device
-    for device_id in entry.data[CONF_DEVICES]:
-        conf = entry.data[CONF_DEVICES][device_id]
-
-        # Create device
-        device_registry = dr.async_get(hass)
-        device = device_registry.async_get_or_create(
-            config_entry_id=entry.entry_id,
-            identifiers={(DOMAIN, conf[CONF_MAC])},
-            name=conf[CONF_NAME],
-        )
-
-        # Set up coordinator
-        coordinator = LightCoordinator(hass, device.id, conf)
-        hass.data[DOMAIN][CONF_DEVICES][device_id] = coordinator
-
-    # Forward the setup to the platforms.
-    hass.async_create_task(
-        hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+async def async_setup_entry(hass: HomeAssistant, entry: IlinkConfigEntry) -> bool:
+    """Set up a lamp. It may be powered off at the wall: the entity stays unavailable until it advertises."""
+    entry.runtime_data = IlinkLight(
+        bluetooth.async_ble_device_from_address(hass, entry.data[CONF_ADDRESS], connectable=True)
     )
-
-    # Set up options listener
-    entry.async_on_unload(entry.add_update_listener(update_listener))
-
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 
 
-# Example migration function
-async def async_migrate_entry(hass, config_entry: ConfigEntry):
-    if config_entry.version == 1:
-        LOGGER.error(
-            "Sorry you have an old configuration, please remove and add again!"
-        )
-        return False
-
-    return True
-
-
-async def update_listener(hass: HomeAssistant, entry: ConfigEntry):
-    LOGGER.debug("Updating iLink Light BLE entry!")
-    await hass.config_entries.async_reload(entry.entry_id)
-
-
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Unload a config entry."""
-    LOGGER.debug("Unloading iLink Light BLE entry!")
-
-    for dev_id, coordinator in hass.data[DOMAIN][CONF_DEVICES].items():
-        await coordinator.async_shutdown()
-
-    # Unload entries
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-
+async def async_unload_entry(hass: HomeAssistant, entry: IlinkConfigEntry) -> bool:
+    """Unload a lamp and drop its BLE connection."""
+    if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
+        await entry.runtime_data.stop()
     return unload_ok
 
 
-async def async_remove_config_entry_device(
-    hass: HomeAssistant, config_entry: ConfigEntry, device_entry: DeviceEntry
-) -> bool:
-    """Remove entities and device from HASS"""
-    device_id = device_entry.id
-    ent_reg = er.async_get(hass)
-    reg_entities = {}
-    for ent in er.async_entries_for_config_entry(ent_reg, config_entry.entry_id):
-        if device_id == ent.device_id:
-            reg_entities[ent.unique_id] = ent.entity_id
-    for entity_id in reg_entities.values():
-        ent_reg.async_remove(entity_id)
-    dev_reg = dr.async_get(hass)
-    dev_reg.async_remove_device(device_id)
-
-    """Remove from config_entry"""
-    devices = []
-    for dev_id, dev_config in config_entry.data[CONF_DEVICES].items():
-        if dev_config[CONF_NAME] == device_entry.name:
-            devices.append(dev_config[CONF_MAC])
-
-    new_data = config_entry.data.copy()
-    for dev in devices:
-        # Remove device from config entry
-        new_data[CONF_DEVICES].pop(dev)
-    hass.config_entries.async_update_entry(config_entry, data=new_data)
-    hass.config_entries._async_schedule_save()
-
-    return True
+async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Migrate v2 (one entry holding a dict of devices, upstream format) to v3 (one entry per lamp)."""
+    if entry.version == 2:
+        devices = list(entry.data.get("devices", {}).values())
+        if len(devices) != 1:
+            _LOGGER.error(
+                "Cannot migrate an iLink entry with %d lamps; remove it and add the lamps again", len(devices)
+            )
+            return False
+        mac = devices[0]["mac"].upper()
+        # keep the existing entity (entity_id, history, area) by moving its unique_id
+        await er.async_migrate_entries(hass, entry.entry_id, lambda _e: {"new_unique_id": mac.lower()})
+        hass.config_entries.async_update_entry(entry, data={CONF_ADDRESS: mac}, unique_id=mac, version=3)
+    return entry.version == 3

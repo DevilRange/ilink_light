@@ -1,0 +1,16 @@
+[tool.ruff]
+target-version = "py313"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "ASYNC", "RUF", "PL", "D"]
+ignore = ["D100", "D104", "D105", "D107", "D203", "D213", "D102", "D103", "D101", "PLR2004", "PLR0912", "PLR0913", "PLR0917", "BLE001", "RUF012"]
+
+[tool.ruff.lint.isort]
+force-sort-within-sections = true
+known-first-party = ["custom_components"]
+combine-as-imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
