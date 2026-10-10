@@ -19,5 +19,5 @@
   "iot_class": "local_polling",
   "issue_tracker": "https://github.com/DevilRange/ilink_light/issues",
   "requirements": [],
-  "version": "3.1.0"
+  "version": "3.2.0"
 }

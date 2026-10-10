@@ -30,7 +30,7 @@ class IlinkConfigFlow(ConfigFlow, domain=DOMAIN):
 
     async def async_step_confirm(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         if user_input is not None:
-            return self.async_create_entry(title=self._info.name, data={CONF_ADDRESS: self._info.address})
+            return self.async_create_entry(title="iLink Light", data={CONF_ADDRESS: self._info.address})
         self._set_confirm_only()
         return self.async_show_form(step_id="confirm", description_placeholders={"name": self._info.name})
 
@@ -38,7 +38,7 @@ class IlinkConfigFlow(ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             await self.async_set_unique_id(user_input[CONF_ADDRESS])
             self._abort_if_unique_id_configured()
-            return self.async_create_entry(title=self._seen[user_input[CONF_ADDRESS]], data=user_input)
+            return self.async_create_entry(title="iLink Light", data=user_input)
         current = self._async_current_ids()
         self._seen = {
             i.address: f"{i.name} ({i.address})"

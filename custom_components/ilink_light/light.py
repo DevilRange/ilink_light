@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from datetime import timedelta
 import logging
+import time
 from typing import Any
 
 from homeassistant.components import bluetooth
@@ -25,13 +26,14 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.event import async_track_time_interval
 
 from . import IlinkConfigEntry, ilink
-from .const import DOMAIN
+from .const import DOMAIN, EVENT_CHANGED
 from .scenes import all_scenes
 
 _LOGGER = logging.getLogger(__name__)
 PARALLEL_UPDATES = 0  # one lamp per entry; commands are serialised by IlinkLight's lock
 POLL_INTERVAL = timedelta(seconds=3)  # picks up IR remote changes; one ~0.1 s read on an open link
 COLOR_FADE = 1.0  # s; the RGB fade takes ~0.6 s and any later command would cut it short
+REMOTE_AFTER = 10  # s; a change confirmed this long after HA's last command came from elsewhere
 SCENE_IDS = {name: i for i, name in all_scenes.items()}
 # White modes as effects, in the remote's MODE-button order (cold is what the lamp powers up in),
 # then app-only presets: name -> (0809 preset level, cold, warm). Night (30/30) has no BLE preset; HA
@@ -76,11 +78,15 @@ class IlinkLightEntity(LightEntity):
         self._polling = False
         self._repoll = False
         self._adv_time: float | None = None
+        self._cmd_gen = 0  # bumped by every command; status readings that overlap a command are dropped
+        self._cmd_time = 0.0  # when HA last sent a command (to tell HA changes from remote ones)
+        self._logged: tuple | None = None  # last confirmed (effect, brightness, kelvin, rgb) for the logbook
         self._attr_unique_id = address.lower()
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, address.lower())},
             connections={(CONNECTION_BLUETOOTH, address)},
             manufacturer="iLink (JieLi)",
+            name="iLink Light",
         )
 
     async def async_added_to_hass(self) -> None:
@@ -154,12 +160,15 @@ class IlinkLightEntity(LightEntity):
         try:
             while True:
                 self._repoll = False
+                gen = self._cmd_gen
                 try:
                     status = await self._lamp.settled()
                 except Exception as err:
                     _LOGGER.debug("%s: poll failed: %s", self._address, err)
                     self._set_available(False)
                     return
+                if gen != self._cmd_gen:  # a command went out meanwhile: this reading is stale, read again
+                    continue
                 if not self._attr_available:  # one state write together with the new status, no "unknown" blip
                     _LOGGER.info("%s is reachable again", self._address)
                     self._attr_available = True
@@ -186,7 +195,36 @@ class IlinkLightEntity(LightEntity):
                 self._attr_color_mode = ColorMode.COLOR_TEMP if s.kelvin else ColorMode.RGB
             if s.on:
                 self._last_on = s
+            self._log_change(s)
         self.async_write_ha_state()
+
+    @callback
+    def _log_change(self, s: ilink.Status) -> None:
+        """Add a logbook entry when the lamp confirms a new mode/brightness/colour while on."""
+        now = (self._attr_effect, self._attr_brightness, self._attr_color_temp_kelvin, self._attr_rgb_color)
+        before, self._logged = self._logged, now if s.on else None
+        if not s.on or before is None or before == now:
+            return  # on/off and unavailable already show up in the logbook as state changes
+        parts = []
+        effect, bri, kelvin, rgb = now
+        if effect != before[0] and effect:
+            parts.append(f"{'mode' if effect in PRESETS else 'scene'} {effect}")
+        if bri != before[1] and s.scene is None and before[1]:
+            parts.append(f"brightness {'up' if bri > before[1] else 'down'} to {round(bri * 100 / 255)} %")
+        if kelvin != before[2] and kelvin and effect not in PRESETS:
+            if before[2]:
+                parts.append(f"{'colder' if kelvin > before[2] else 'warmer'} ({kelvin} K)")
+            else:
+                parts.append(f"white {kelvin} K")
+        if rgb != before[3] and kelvin is None and s.scene is None:
+            parts.append("colour RGB {}, {}, {}".format(*rgb))
+        if not parts:
+            return
+        remote = time.monotonic() - self._cmd_time > REMOTE_AFTER
+        self.hass.bus.async_fire(
+            EVENT_CHANGED,
+            {"entity_id": self.entity_id, "change": ", ".join(parts), "remote": remote},
+        )
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         was_on = bool(self.is_on)
@@ -206,17 +244,15 @@ class IlinkLightEntity(LightEntity):
             bri = bri or last.brightness
         if effect:  # scene snapshots carry colour attributes too; the effect is what matters
             rgb = kelvin = None
-        try:
-            if not was_on:
-                await self._lamp.send(ilink.ON)
-            bri = await self._apply(bri, rgb, kelvin, effect)
-        except Exception as err:
-            raise self._error(err) from err
+        self._cmd_gen += 1
+        self._cmd_time = time.monotonic()
+        # optimistic: show the new state right away; the settled readback afterwards corrects it if the lamp disagrees
         self._attr_is_on = True
         if effect or rgb or kelvin:
             self._attr_effect = effect
-        if bri:
-            self._attr_brightness = bri
+        shown_bri = NIGHT_BRI if effect == NIGHT else 255 if effect in PRESETS and not bri else bri
+        if shown_bri:
+            self._attr_brightness = shown_bri
         if rgb:
             self._attr_color_mode, self._attr_rgb_color = ColorMode.RGB, tuple(rgb)
         elif kelvin or effect in PRESETS:
@@ -225,6 +261,14 @@ class IlinkLightEntity(LightEntity):
         elif effect:
             self._attr_color_mode = ColorMode.RGB
         self.async_write_ha_state()
+        try:
+            if not was_on:
+                await self._lamp.send(ilink.ON)
+            await self._apply(bri, rgb, kelvin, effect)
+        except Exception as err:
+            self._schedule_poll()  # show what the lamp really did
+            raise self._error(err) from err
+        self._cmd_gen += 1  # readings taken while the commands went out are stale too
         self._schedule_poll()  # confirm with the lamp's settled state
 
     def _error(self, err: Exception) -> HomeAssistantError:
@@ -260,10 +304,13 @@ class IlinkLightEntity(LightEntity):
         return bri
 
     async def async_turn_off(self, **kwargs: Any) -> None:
+        self._cmd_gen += 1
+        self._cmd_time = time.monotonic()
         try:
             await self._lamp.send(ilink.OFF)
         except Exception as err:
             raise self._error(err) from err
+        self._cmd_gen += 1
         self._attr_is_on = False
         self.async_write_ha_state()
         self._schedule_poll()

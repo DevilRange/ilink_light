@@ -59,6 +59,8 @@ One light entity per lamp with:
 - RGB colour
 - the remote's modes and the lamp's built-in scenes as effects
 - state read back from the lamp every few seconds, so changes made with the IR remote show up in Home Assistant
+- the Activity log shows what changed, not just on and off: "mode White: warm", "brightness down to 40 %",
+  "colder (5000 K)", "scene Rainbow", with "(remote)" when it wasn't done from Home Assistant
 - the entity goes *unavailable* when the lamp loses power and comes back by itself when power returns
 
 ### Effects

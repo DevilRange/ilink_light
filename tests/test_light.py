@@ -16,11 +16,11 @@ import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.ilink_light import ilink
-from custom_components.ilink_light.const import DOMAIN
+from custom_components.ilink_light.const import DOMAIN, EVENT_CHANGED
 
 from .conftest import ADDRESS
 
-ENTITY = "light.ilink"
+ENTITY = "light.ilink_light"
 
 
 @pytest.fixture
@@ -122,3 +122,59 @@ async def test_command_error_is_translated(hass: HomeAssistant, fake) -> None:
     with pytest.raises(HomeAssistantError) as err:
         await hass.services.async_call(LIGHT, "turn_off", {ATTR_ENTITY_ID: ENTITY}, blocking=True)
     assert err.value.translation_key == "command_failed"
+
+
+async def test_stale_reading_does_not_undo_a_command(hass: HomeAssistant, fake) -> None:
+    entity = hass.data[LIGHT].get_entity(ENTITY)
+    readings = []
+
+    async def settled():
+        readings.append(1)
+        if len(readings) == 1:
+            entity._cmd_gen += 1  # a command goes out while this reading is in flight
+            return ilink.Status(True, 255, (0, 0, 0), 255, 0, None)  # old: cold
+        return ilink.Status(True, 255, (0, 0, 0), 0, 255, None)  # new: warm
+
+    fake.settled = settled
+    await entity._poll()
+    assert len(readings) == 2
+    assert hass.states.get(ENTITY).attributes[ATTR_EFFECT] == "White: warm"
+
+
+async def test_effect_shows_immediately(hass: HomeAssistant, fake) -> None:
+    shown_when_sent = []
+    send = fake.send
+
+    async def spy(*frames):
+        shown_when_sent.append(hass.states.get(ENTITY).attributes.get(ATTR_EFFECT))
+        await send(*frames)
+
+    fake.send = spy
+    fake.state = ilink.Status(True, 255, (0, 0, 0), 0, 255, None)
+    await turn_on(hass, fake, **{ATTR_EFFECT: "White: warm"})
+    assert shown_when_sent == ["White: warm"]  # the UI already showed it before the lamp was asked
+
+
+async def test_logbook_events(hass: HomeAssistant, fake) -> None:
+    events = []
+    hass.bus.async_listen(EVENT_CHANGED, lambda e: events.append(e.data))
+    entity = hass.data[LIGHT].get_entity(ENTITY)
+    entity._cmd_time = -1e9  # long ago: whatever changes now came from the remote
+    await poll(hass, fake, ilink.Status(True, 255, (0, 0, 0), 0, 255, None))  # MODE button
+    await poll(hass, fake, ilink.Status(True, 128, (0, 0, 0), 0, 255, None))  # brightness -
+    await poll(hass, fake, ilink.Status(True, 128, (0, 0, 0), 20, 235, None))  # cold button
+    await poll(hass, fake, ilink.Status(True, 128, (9, 9, 9), 0, 0, 1))  # RGB button
+    await hass.async_block_till_done()
+    assert [e["change"] for e in events] == [
+        "mode White: warm",
+        "brightness down to 50 %",
+        "colder (3235 K)",
+        "scene Rainbow",
+    ]
+    assert all(e["remote"] for e in events)
+    events.clear()
+    fake.state = ilink.Status(True, 255, (0, 0, 0), 255, 255, None)
+    await turn_on(hass, fake, **{ATTR_EFFECT: "White: sunlight (max)"})
+    assert events == [
+        {"entity_id": ENTITY, "change": "mode White: sunlight (max), brightness up to 100 %", "remote": False}
+    ]
